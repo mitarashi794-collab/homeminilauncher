@@ -2,9 +2,22 @@ package com.example.minilauncher
 
 import android.app.Activity
 import android.app.AlertDialog
-import android.appwidget.AppWidgetHost
-import android.appwidget.AppWidgetManager
-import android.appwidget.AppWidgetProviderInfo
+import android.content.ComponentName
+import android.media.AudioManager
+import android.media.MediaMetadata
+import android.media.session.MediaController
+import android.media.session.MediaSessionManager
+import android.media.session.PlaybackState
+import android.os.Handler
+import android.os.Looper
+import android.service.notification.NotificationListenerService
+import android.view.KeyEvent
+import android.view.WindowManager
+import android.widget.TextClock
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Paint
+import java.util.Calendar
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.graphics.Color
@@ -42,15 +55,14 @@ class MainActivity : Activity() {
         val packageName: String,
         val activityName: String,
         val group: Int, // 0..25 = A..Z, 26 = それ以外(#)
+        val original: String, // 端末上の本来のアプリ名（label は変更後の表示名）
     ) {
         val key: String get() = "$packageName/$activityName"
     }
 
     private companion object {
-        const val WIDGET_HOST_ID = 1024
-        const val REQ_BIND = 1
-        const val REQ_CONFIGURE = 2
         const val SLOT_RIGHT = "swipeRight"
+        const val SLOT_UP = "swipeUp"
         const val PREF_BROWSER = "browserPkg"
         const val PREF_TEXT = "textSize"
         val TEXT_SCALES = floatArrayOf(0.85f, 1.0f, 1.2f, 1.4f)
@@ -63,6 +75,7 @@ class MainActivity : Activity() {
     private var shown: List<AppItem> = emptyList() // 検索で絞り込んだ後の表示リスト
     private val favorites = mutableListOf<String>()
     private val prefs by lazy { getSharedPreferences("launcher", MODE_PRIVATE) }
+    private val namePrefs by lazy { getSharedPreferences("names", MODE_PRIVATE) } // 変更したアプリ名
 
     private val textIndex: Int get() = prefs.getInt(PREF_TEXT, 1).coerceIn(0, TEXT_SCALES.size - 1)
     private val textScale: Float get() = TEXT_SCALES[textIndex]
@@ -70,11 +83,6 @@ class MainActivity : Activity() {
     private lateinit var pager: TwoPagePager
     private lateinit var favScroll: ScrollView
     private lateinit var favContainer: LinearLayout
-    private lateinit var widgetBox: LinearLayout
-    private lateinit var widgetManager: AppWidgetManager
-    private lateinit var widgetHost: AppWidgetHost
-    private val widgetIds = mutableListOf<Int>()
-    private var pendingWidgetId = -1
     private lateinit var listView: ListView
     private lateinit var searchBox: EditText
     private lateinit var slider: AlphabetSlider
@@ -83,12 +91,6 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        widgetManager = AppWidgetManager.getInstance(this)
-        widgetHost = AppWidgetHost(this, WIDGET_HOST_ID)
-        widgetIds.addAll(
-            (prefs.getString("widgets", "") ?: "").split(",").mapNotNull { it.toIntOrNull() },
-        )
 
         favorites.addAll(
             (prefs.getString("favorites", "") ?: "").split("\n").filter { it.isNotEmpty() },
@@ -116,22 +118,11 @@ class MainActivity : Activity() {
             )
         }
 
-        // ホームページ = 上にウィジェット、下にお気に入り。長押しでウィジェットの追加/削除
-        widgetBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setOnLongClickListener {
-                showWidgetMenu()
-                true
-            }
-        }
-        favContainer.setOnLongClickListener {
-            showWidgetMenu()
-            true
-        }
+        // ホームページ = 上に時計と音楽、下にお気に入り
         val homePage = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(
-                widgetBox,
+                buildHomeTop(),
                 LinearLayout.LayoutParams(match, ViewGroup.LayoutParams.WRAP_CONTENT),
             )
             addView(favScroll, LinearLayout.LayoutParams(match, 0, 1f))
@@ -239,28 +230,17 @@ class MainActivity : Activity() {
         root.addView(pager, FrameLayout.LayoutParams(match, match))
 
         setContentView(root)
-        renderWidgets()
-    }
-
-    override fun onStart() {
-        super.onStart()
-        try {
-            widgetHost.startListening()
-        } catch (_: Exception) {
-        }
-    }
-
-    override fun onStop() {
-        try {
-            widgetHost.stopListening()
-        } catch (_: Exception) {
-        }
-        super.onStop()
     }
 
     override fun onResume() {
         super.onResume()
         loadApps()
+        handler.post(musicTicker)
+    }
+
+    override fun onPause() {
+        handler.removeCallbacks(musicTicker)
+        super.onPause()
     }
 
     // ホームボタンを押したらお気に入りホームに戻る
@@ -300,7 +280,7 @@ class MainActivity : Activity() {
         adapter.notifyDataSetChanged()
     }
 
-    // ---- ホームのスワイプ操作（上=アプリ、右=アプリ2、下=通知） ----
+    // ---- ホームのスワイプ操作（上=アプリ2、右=アプリ、下=通知パネル） ----
 
     private val gestureDetector by lazy {
         GestureDetector(
@@ -312,7 +292,7 @@ class MainActivity : Activity() {
                     velocityX: Float,
                     velocityY: Float,
                 ): Boolean {
-                    if (e1 == null || pager.page != 0 || startedOnWidget(e1)) return false
+                    if (e1 == null || pager.page != 0) return false
                     val dx = e2.x - e1.x
                     val dy = e2.y - e1.y
                     val min = dp(80)
@@ -320,7 +300,7 @@ class MainActivity : Activity() {
                         abs(dy) > abs(dx) * 1.5f && abs(dy) > min && abs(velocityY) > 800f -> {
                             // お気に入りが多くてスクロール中のときは、端まで行った後のスワイプだけ反応させる
                             if (dy < 0 && !favScroll.canScrollVertically(1)) {
-                                openSearch()
+                                launchSwipeSlot(SLOT_UP)
                             } else if (dy > 0 && !favScroll.canScrollVertically(-1)) {
                                 expandNotifications()
                             }
@@ -338,15 +318,6 @@ class MainActivity : Activity() {
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
         gestureDetector.onTouchEvent(ev)
         return super.dispatchTouchEvent(ev)
-    }
-
-    // スクロールするウィジェット上のスワイプは、ウィジェット側の操作として扱う
-    private fun startedOnWidget(e: MotionEvent): Boolean {
-        if (widgetBox.childCount == 0) return false
-        val loc = IntArray(2)
-        widgetBox.getLocationOnScreen(loc)
-        return e.rawX >= loc[0] && e.rawX <= loc[0] + widgetBox.width &&
-            e.rawY >= loc[1] && e.rawY <= loc[1] + widgetBox.height
     }
 
     private fun toggleSwipeSlot(slot: String, app: AppItem) {
@@ -424,20 +395,22 @@ class MainActivity : Activity() {
     private fun showSettings() {
         val pkg = prefs.getString(PREF_BROWSER, null)
         val browser = if (pkg == null) "システム標準" else appLabelOf(pkg)
-        val swipeKey = prefs.getString(SLOT_RIGHT, null)
-        val swipeApp = apps.firstOrNull { it.key == swipeKey }?.label ?: "未設定"
         val labels = arrayOf(
             "文字の大きさ（現在: ${TEXT_LABELS[textIndex]}）",
-            "右スワイプで開くアプリ（現在: $swipeApp）",
+            "右スワイプで開くアプリ（現在: ${swipeAppLabel(SLOT_RIGHT)}）",
+            "上スワイプで開くアプリ（現在: ${swipeAppLabel(SLOT_UP)}）",
             "ブラウザ（現在: $browser）",
+            "端末の設定を開く",
         )
         AlertDialog.Builder(this)
             .setTitle("設定")
             .setItems(labels) { _, which ->
                 when (which) {
                     0 -> showTextSizeChooser()
-                    1 -> showSwipeAppChooser()
-                    2 -> showBrowserChooser()
+                    1 -> showSwipeAppChooser(SLOT_RIGHT, "右スワイプで開くアプリ")
+                    2 -> showSwipeAppChooser(SLOT_UP, "上スワイプで開くアプリ")
+                    3 -> showBrowserChooser()
+                    4 -> openDeviceSettings()
                 }
             }
             .show()
@@ -461,16 +434,29 @@ class MainActivity : Activity() {
         adapter.notifyDataSetChanged()
     }
 
-    private fun showSwipeAppChooser() {
+    private fun swipeAppLabel(slot: String): String {
+        val key = prefs.getString(slot, null)
+        return apps.firstOrNull { it.key == key }?.label ?: "未設定"
+    }
+
+    private fun showSwipeAppChooser(slot: String, title: String) {
         val labels = (listOf("未設定") + apps.map { it.label }).toTypedArray()
         AlertDialog.Builder(this)
-            .setTitle("右スワイプで開くアプリ")
+            .setTitle(title)
             .setItems(labels) { _, which ->
                 val editor = prefs.edit()
-                if (which == 0) editor.remove(SLOT_RIGHT) else editor.putString(SLOT_RIGHT, apps[which - 1].key)
+                if (which == 0) editor.remove(slot) else editor.putString(slot, apps[which - 1].key)
                 editor.apply()
             }
             .show()
+    }
+
+    // 端末本体の設定アプリを開く
+    private fun openDeviceSettings() {
+        try {
+            startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (_: ActivityNotFoundException) {
+        }
     }
 
     private fun showBrowserChooser() {
@@ -492,55 +478,167 @@ class MainActivity : Activity() {
             .show()
     }
 
-    // ---- ウィジェット ----
+    // ---- ホームの時計（アナログ + デジタル）と音楽プレイヤー ----
 
-    private fun saveWidgetIds() {
-        prefs.edit().putString("widgets", widgetIds.joinToString(",")).apply()
-    }
-
-    private fun renderWidgets() {
-        widgetBox.removeAllViews()
-        var removed = false
-        val iter = widgetIds.iterator()
-        while (iter.hasNext()) {
-            val id = iter.next()
-            val info = widgetManager.getAppWidgetInfo(id)
-            if (info == null) {
-                // 提供元アプリがアンインストールされた等
-                widgetHost.deleteAppWidgetId(id)
-                iter.remove()
-                removed = true
-                continue
-            }
-            widgetBox.addView(buildWidgetView(id, info))
+    private val handler = Handler(Looper.getMainLooper())
+    private val musicTicker = object : Runnable {
+        override fun run() {
+            refreshMusic()
+            handler.postDelayed(this, 1000)
         }
-        if (removed) saveWidgetIds()
-        widgetBox.setPadding(dp(28), if (widgetBox.childCount > 0) dp(24) else 0, dp(28), 0)
     }
+    private lateinit var musicTitle: TextView
+    private lateinit var musicArtist: TextView
+    private lateinit var playButton: TextView
+    private var currentController: MediaController? = null
 
-    private fun buildWidgetView(id: Int, info: AppWidgetProviderInfo): View {
-        val view = widgetHost.createView(this, id, info)
-        view.setOnLongClickListener {
-            showWidgetMenu()
-            true
+    private fun buildHomeTop(): View {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(28), dp(24), dp(28), 0)
         }
-        val density = resources.displayMetrics.density
-        val wDp = (resources.displayMetrics.widthPixels / density - 56).toInt()
-        val hDp = (info.minHeight / density).toInt()
-        view.updateAppWidgetSize(Bundle(), wDp, hDp, wDp, hDp)
-        view.layoutParams = LinearLayout.LayoutParams(match, info.minHeight.coerceAtLeast(dp(60)))
-            .apply { bottomMargin = dp(8) }
-        return view
+
+        // 時計: 左にアナログ、右にデジタル（時刻と日付）
+        val digital = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), 0, 0, 0)
+        }
+        digital.addView(
+            TextClock(this).apply {
+                format24Hour = "HH:mm"
+                format12Hour = "HH:mm"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 48f)
+            },
+        )
+        digital.addView(
+            TextClock(this).apply {
+                format24Hour = "M月d日（E）"
+                format12Hour = "M月d日（E）"
+                setTextColor(Color.argb(200, 255, 255, 255))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            },
+        )
+        val clockRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(AnalogClockView(this@MainActivity), LinearLayout.LayoutParams(dp(120), dp(120)))
+            addView(
+                digital,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+            )
+        }
+        box.addView(clockRow, LinearLayout.LayoutParams(match, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        // 音楽: 曲名とアーティスト、前へ / 再生・一時停止 / 次へ
+        musicTitle = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setSingleLine(true)
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        musicArtist = TextView(this).apply {
+            setTextColor(Color.argb(170, 255, 255, 255))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setSingleLine(true)
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        val info = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(musicTitle)
+            addView(musicArtist)
+            setOnClickListener { onMusicInfoClick() }
+        }
+        playButton = mediaButton("\u25B6\uFE0E", KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+        val musicRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(info, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(
+                mediaButton("\u25C0\u25C0\uFE0E", KeyEvent.KEYCODE_MEDIA_PREVIOUS),
+                LinearLayout.LayoutParams(dp(48), dp(48)),
+            )
+            addView(playButton, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(
+                mediaButton("\u25B6\u25B6\uFE0E", KeyEvent.KEYCODE_MEDIA_NEXT),
+                LinearLayout.LayoutParams(dp(48), dp(48)),
+            )
+        }
+        box.addView(
+            musicRow,
+            LinearLayout.LayoutParams(match, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { topMargin = dp(16) },
+        )
+        return box
     }
 
-    private fun showWidgetMenu() {
-        val labels = mutableListOf("ウィジェットを追加")
-        if (widgetIds.isNotEmpty()) labels.add("ウィジェットを削除")
-        AlertDialog.Builder(this)
-            .setItems(labels.toTypedArray()) { _, which ->
-                if (which == 0) showAddWidgetDialog() else showRemoveWidgetDialog()
+    private fun mediaButton(label: String, keyCode: Int): TextView =
+        TextView(this).apply {
+            text = label
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+            gravity = Gravity.CENTER
+            setOnClickListener { sendMediaKey(keyCode) }
+        }
+
+    // 再生中のアプリに、イヤホンのボタンと同じ「メディアキー」を送る（特別な許可は不要）
+    private fun sendMediaKey(keyCode: Int) {
+        val audio = getSystemService(AUDIO_SERVICE) as AudioManager
+        audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
+        audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
+        handler.postDelayed({ refreshMusic() }, 300)
+    }
+
+    // 曲名の表示には「通知へのアクセス」の許可が必要（Androidの仕組み上、ここ経由でしか再生情報を読めない）
+    private fun isNotificationAccessEnabled(): Boolean {
+        val flat = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+            ?: return false
+        return flat.split(":").any { ComponentName.unflattenFromString(it)?.packageName == packageName }
+    }
+
+    private fun refreshMusic() {
+        if (!isNotificationAccessEnabled()) {
+            currentController = null
+            musicTitle.text = "タップして通知へのアクセスを許可"
+            musicArtist.text = "曲名の表示に使います（操作ボタンは許可なしでも使えます）"
+            playButton.text = "\u25B6\uFE0E"
+            return
+        }
+        val controllers = try {
+            getSystemService(MediaSessionManager::class.java)
+                .getActiveSessions(ComponentName(this, MediaListenerService::class.java))
+        } catch (_: SecurityException) {
+            emptyList<MediaController>()
+        }
+        val c = controllers.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+            ?: controllers.firstOrNull()
+        currentController = c
+        if (c == null) {
+            musicTitle.text = "再生中の曲はありません"
+            musicArtist.text = ""
+            playButton.text = "\u25B6\uFE0E"
+            return
+        }
+        val md = c.metadata
+        musicTitle.text = md?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "（曲名なし）"
+        musicArtist.text = md?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
+        playButton.text =
+            if (c.playbackState?.state == PlaybackState.STATE_PLAYING) "\u275A\u275A" else "\u25B6\uFE0E"
+    }
+
+    // 曲名をタップ: 許可がなければ許可画面へ、あれば再生中のアプリを開く
+    private fun onMusicInfoClick() {
+        if (!isNotificationAccessEnabled()) {
+            try {
+                startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+            } catch (_: ActivityNotFoundException) {
             }
-            .show()
+            return
+        }
+        try {
+            currentController?.sessionActivity?.send()
+        } catch (_: Exception) {
+        }
     }
 
     private fun appLabelOf(pkg: String): String =
@@ -550,95 +648,6 @@ class MainActivity : Activity() {
             pkg
         }
 
-    private fun showAddWidgetDialog() {
-        val pm = packageManager
-        val providers = widgetManager.installedProviders
-            .sortedBy { it.loadLabel(pm).lowercase() }
-        if (providers.isEmpty()) return
-        val labels = providers
-            .map { "${it.loadLabel(pm)}（${appLabelOf(it.provider.packageName)}）" }
-            .toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("ウィジェットを追加")
-            .setItems(labels) { _, which -> startBind(providers[which]) }
-            .show()
-    }
-
-    private fun showRemoveWidgetDialog() {
-        val pm = packageManager
-        val labels = widgetIds
-            .map { widgetManager.getAppWidgetInfo(it)?.loadLabel(pm)?.toString() ?: "ウィジェット" }
-            .toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("ウィジェットを削除")
-            .setItems(labels) { _, which -> removeWidget(widgetIds[which]) }
-            .show()
-    }
-
-    private fun removeWidget(id: Int) {
-        widgetHost.deleteAppWidgetId(id)
-        widgetIds.remove(id)
-        saveWidgetIds()
-        renderWidgets()
-    }
-
-    // 追加の流れ: ID確保 → バインド（必要ならシステムの許可画面）→ 設定画面（あれば）→ 配置
-    private fun startBind(info: AppWidgetProviderInfo) {
-        val id = widgetHost.allocateAppWidgetId()
-        pendingWidgetId = id
-        if (widgetManager.bindAppWidgetIdIfAllowed(id, info.provider)) {
-            configureOrAdd(id)
-        } else {
-            val intent = Intent(AppWidgetManager.ACTION_APPWIDGET_BIND)
-                .putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id)
-                .putExtra(AppWidgetManager.EXTRA_APPWIDGET_PROVIDER, info.provider)
-            try {
-                startActivityForResult(intent, REQ_BIND)
-            } catch (_: ActivityNotFoundException) {
-                cancelPendingWidget()
-            }
-        }
-    }
-
-    private fun configureOrAdd(id: Int) {
-        val info = widgetManager.getAppWidgetInfo(id)
-        if (info?.configure == null) {
-            addWidget(id)
-            return
-        }
-        try {
-            widgetHost.startAppWidgetConfigureActivityForResult(this, id, 0, REQ_CONFIGURE, null)
-        } catch (_: Exception) {
-            cancelPendingWidget()
-        }
-    }
-
-    private fun addWidget(id: Int) {
-        widgetIds.add(id)
-        saveWidgetIds()
-        pendingWidgetId = -1
-        renderWidgets()
-        pager.goTo(0)
-    }
-
-    private fun cancelPendingWidget() {
-        if (pendingWidgetId != -1) widgetHost.deleteAppWidgetId(pendingWidgetId)
-        pendingWidgetId = -1
-    }
-
-    @Deprecated("Deprecated in Java")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        val id = pendingWidgetId
-        if (id == -1) return
-        when (requestCode) {
-            REQ_BIND ->
-                if (resultCode == RESULT_OK) configureOrAdd(id) else cancelPendingWidget()
-            REQ_CONFIGURE ->
-                if (resultCode == RESULT_OK) addWidget(id) else cancelPendingWidget()
-        }
-    }
-
     private fun loadApps() {
         val query = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         val pm = packageManager
@@ -646,8 +655,11 @@ class MainActivity : Activity() {
         apps = pm.queryIntentActivities(query, 0)
             .filter { it.activityInfo.packageName != packageName }
             .map {
-                val label = it.loadLabel(pm).toString()
-                AppItem(label, it.activityInfo.packageName, it.activityInfo.name, groupOf(label))
+                val original = it.loadLabel(pm).toString()
+                val pkg = it.activityInfo.packageName
+                val act = it.activityInfo.name
+                val label = namePrefs.getString("$pkg/$act", null) ?: original
+                AppItem(label, pkg, act, groupOf(label), original)
             }
             .sortedWith(
                 Comparator<AppItem> { a, b -> a.group.compareTo(b.group) }
@@ -685,7 +697,7 @@ class MainActivity : Activity() {
         if (items.isEmpty()) {
             favContainer.addView(
                 TextView(this).apply {
-                    text = "左にスワイプしてアプリ一覧を開き、アプリを長押ししてお気に入りに追加します。\n\nこの画面を長押しすると、ウィジェットを追加できます。"
+                    text = "左にスワイプしてアプリ一覧を開き、アプリを長押ししてお気に入りに追加します。"
                     setTextColor(Color.argb(180, 255, 255, 255))
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f * textScale)
                 },
@@ -737,9 +749,12 @@ class MainActivity : Activity() {
     private fun showListMenu(app: AppItem) {
         val isFav = app.key in favorites
         val isRight = prefs.getString(SLOT_RIGHT, null) == app.key
+        val isUp = prefs.getString(SLOT_UP, null) == app.key
         val labels = arrayOf(
             if (isFav) "お気に入りから外す" else "お気に入りに追加",
+            "名前を変更",
             if (isRight) "右スワイプの設定を解除" else "右スワイプで開くアプリにする",
+            if (isUp) "上スワイプの設定を解除" else "上スワイプで開くアプリにする",
             "アプリ情報",
         )
         AlertDialog.Builder(this)
@@ -747,25 +762,59 @@ class MainActivity : Activity() {
             .setItems(labels) { _, which ->
                 when (which) {
                     0 -> toggleFavorite(app)
-                    1 -> toggleSwipeSlot(SLOT_RIGHT, app)
-                    2 -> openAppInfo(app)
+                    1 -> showRenameDialog(app)
+                    2 -> toggleSwipeSlot(SLOT_RIGHT, app)
+                    3 -> toggleSwipeSlot(SLOT_UP, app)
+                    4 -> openAppInfo(app)
                 }
             }
             .show()
     }
 
     private fun showFavoriteMenu(app: AppItem) {
-        val labels = arrayOf("上へ移動", "お気に入りから外す", "アプリ情報")
+        val labels = arrayOf("上へ移動", "お気に入りから外す", "名前を変更", "アプリ情報")
         AlertDialog.Builder(this)
             .setTitle(app.label)
             .setItems(labels) { _, which ->
                 when (which) {
                     0 -> moveUp(app)
                     1 -> toggleFavorite(app)
-                    2 -> openAppInfo(app)
+                    2 -> showRenameDialog(app)
+                    3 -> openAppInfo(app)
                 }
             }
             .show()
+    }
+
+    // アプリ名の変更。空にするか「元に戻す」で、端末上の本来の名前に戻る
+    private fun showRenameDialog(app: AppItem) {
+        val input = EditText(this).apply {
+            setText(app.label)
+            setSelection(text.length)
+            setSingleLine(true)
+        }
+        val box = FrameLayout(this).apply {
+            setPadding(dp(20), dp(8), dp(20), 0)
+            addView(input)
+        }
+        val builder = AlertDialog.Builder(this)
+            .setTitle("名前を変更")
+            .setView(box)
+            .setPositiveButton("変更") { _, _ -> setCustomName(app, input.text.toString().trim()) }
+            .setNegativeButton("キャンセル", null)
+        if (app.label != app.original) {
+            builder.setNeutralButton("元に戻す") { _, _ -> setCustomName(app, "") }
+        }
+        val dialog = builder.create()
+        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
+        dialog.show()
+    }
+
+    private fun setCustomName(app: AppItem, name: String) {
+        val editor = namePrefs.edit()
+        if (name.isEmpty() || name == app.original) editor.remove(app.key) else editor.putString(app.key, name)
+        editor.apply()
+        loadApps() // 並び順・お気に入り・検索結果もまとめて更新する
     }
 
     // ---- 起動 ----
@@ -824,5 +873,88 @@ class MainActivity : Activity() {
             }
             return view
         }
+    }
+}
+
+
+// 曲名を読むには「通知へのアクセス」を受け取るサービスが必要。中身は空でよい。
+class MediaListenerService : NotificationListenerService()
+
+// ホームに置くアナログ時計（秒針つき）。画面に見えている間だけ毎秒描き直す。
+class AnalogClockView(context: Context) : View(context) {
+
+    private val density = resources.displayMetrics.density
+
+    private fun paint(color: Int, widthDp: Float, style: Paint.Style = Paint.Style.STROKE) =
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            this.style = style
+            strokeWidth = widthDp * density
+            strokeCap = Paint.Cap.ROUND
+        }
+
+    private val ring = paint(Color.WHITE, 2f)
+    private val tick = paint(Color.WHITE, 2f)
+    private val hourHand = paint(Color.WHITE, 4.5f)
+    private val minuteHand = paint(Color.WHITE, 3f)
+    private val accent = Color.rgb(255, 193, 7)
+    private val secondHand = paint(accent, 1.5f)
+    private val hub = paint(accent, 1f, Paint.Style.FILL)
+
+    private val ticker = object : Runnable {
+        override fun run() {
+            invalidate()
+            postDelayed(this, 1000)
+        }
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        if (windowVisibility == View.VISIBLE) restart()
+    }
+
+    override fun onDetachedFromWindow() {
+        removeCallbacks(ticker)
+        super.onDetachedFromWindow()
+    }
+
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        if (visibility == View.VISIBLE) restart() else removeCallbacks(ticker)
+    }
+
+    private fun restart() {
+        removeCallbacks(ticker)
+        post(ticker)
+    }
+
+    // 中心から角度 deg（12時が0度、時計回り）の向きに、半径 from..to の線を引く
+    private fun line(canvas: Canvas, cx: Float, cy: Float, deg: Float, from: Float, to: Float, p: Paint) {
+        val rad = Math.toRadians(deg.toDouble())
+        val sin = Math.sin(rad).toFloat()
+        val cos = Math.cos(rad).toFloat()
+        canvas.drawLine(cx + from * sin, cy - from * cos, cx + to * sin, cy - to * cos, p)
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val cx = width / 2f
+        val cy = height / 2f
+        val r = minOf(width, height) / 2f - ring.strokeWidth
+        canvas.drawCircle(cx, cy, r, ring)
+
+        for (i in 0 until 12) {
+            val major = i % 3 == 0
+            tick.strokeWidth = (if (major) 2.5f else 1.5f) * density
+            line(canvas, cx, cy, i * 30f, r * (if (major) 0.80f else 0.88f), r * 0.95f, tick)
+        }
+
+        val cal = Calendar.getInstance()
+        val sec = cal.get(Calendar.SECOND).toFloat()
+        val min = cal.get(Calendar.MINUTE) + sec / 60f
+        val hour = cal.get(Calendar.HOUR) + min / 60f
+        line(canvas, cx, cy, hour * 30f, 0f, r * 0.5f, hourHand)
+        line(canvas, cx, cy, min * 6f, 0f, r * 0.75f, minuteHand)
+        line(canvas, cx, cy, sec * 6f, -r * 0.15f, r * 0.85f, secondHand)
+        canvas.drawCircle(cx, cy, 3f * density, hub)
     }
 }
