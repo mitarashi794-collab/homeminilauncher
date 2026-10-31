@@ -378,7 +378,9 @@ class MainActivity : Activity() {
 
     // ---- 検索・Web検索・設定 ----
 
-    private fun query(): String = searchBox.text.toString().trim()
+    // 画面の組み立て中（searchBox作成前）にアダプターから呼ばれても落ちないようにする
+    private fun query(): String =
+        if (::searchBox.isInitialized) searchBox.text.toString().trim() else ""
 
     // 上スワイプ: アプリ一覧（検索欄）へ飛んでキーボードを出す
     private fun openSearch() {
