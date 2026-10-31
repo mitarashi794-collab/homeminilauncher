@@ -1,0 +1,41 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Arrange files
+        run: |
+          mkdir -p app/src/main/res/values app/src/main/java/com/example/minilauncher
+          mv_if() { [ -f "$1" ] && mv "$1" "$2" || true; }
+          mv_if app-build.gradle.kts app/build.gradle.kts
+          mv_if AndroidManifest.xml app/src/main/AndroidManifest.xml
+          mv_if strings.xml app/src/main/res/values/strings.xml
+          mv_if themes.xml app/src/main/res/values/themes.xml
+          mv_if MainActivity.kt app/src/main/java/com/example/minilauncher/MainActivity.kt
+          mv_if AlphabetSlider.kt app/src/main/java/com/example/minilauncher/AlphabetSlider.kt
+          mv_if TwoPagePager.kt app/src/main/java/com/example/minilauncher/TwoPagePager.kt
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build debug APK
+        run: gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MiniLauncher-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
