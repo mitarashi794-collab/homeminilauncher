@@ -76,6 +76,7 @@ class MainActivity : Activity() {
         const val PREF_PLAYER = "playerPkg"
         const val PREF_TEXT = "textSize"
         const val PREF_HIDDEN = "hiddenApps"
+        const val PREF_CLOCK = "clockApp"
         const val PREF_COLOR = "textColor"
         const val DEFAULT_COLOR = "#FFFFFF"
         val TEXT_SCALES = floatArrayOf(0.85f, 1.0f, 1.2f, 1.4f)
@@ -444,6 +445,7 @@ class MainActivity : Activity() {
             "右スワイプで開くアプリ（現在: ${swipeAppLabel(SLOT_RIGHT)}）",
             "上スワイプで開くアプリ（現在: ${swipeAppLabel(SLOT_UP)}）",
             "音楽プレイヤー（現在: ${playerLabel()}）",
+            "時計をタップで開くアプリ（現在: ${clockLabel()}）",
             "ブラウザ（現在: $browser）",
             "非表示のアプリ（現在: ${apps.count { it.key in hiddenKeys }}件）",
             "端末の設定を開く",
@@ -457,9 +459,10 @@ class MainActivity : Activity() {
                     2 -> showSwipeAppChooser(SLOT_RIGHT, "右スワイプで開くアプリ")
                     3 -> showSwipeAppChooser(SLOT_UP, "上スワイプで開くアプリ")
                     4 -> showPlayerChooser()
-                    5 -> showBrowserChooser()
-                    6 -> showHiddenApps()
-                    7 -> openDeviceSettings()
+                    5 -> showClockAppChooser()
+                    6 -> showBrowserChooser()
+                    7 -> showHiddenApps()
+                    8 -> openDeviceSettings()
                 }
             }
             .show()
@@ -572,6 +575,40 @@ class MainActivity : Activity() {
             .show()
     }
 
+    // ホームの時計をタップしたときに開くアプリ。未設定のときは端末の時計アプリ（アラーム画面）
+    private fun openClockApp() {
+        val key = prefs.getString(PREF_CLOCK, null)
+        val app = apps.firstOrNull { it.key == key }
+        if (app != null) {
+            launch(app)
+            return
+        }
+        try {
+            startActivity(
+                Intent(android.provider.AlarmClock.ACTION_SHOW_ALARMS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, "設定で時計を開くアプリを選んでください", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun clockLabel(): String {
+        val key = prefs.getString(PREF_CLOCK, null)
+        return apps.firstOrNull { it.key == key }?.label ?: "自動"
+    }
+
+    private fun showClockAppChooser() {
+        val labels = (listOf("自動（端末の時計アプリ）") + apps.map { it.label }).toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("時計をタップで開くアプリ")
+            .setItems(labels) { _, which ->
+                val editor = prefs.edit()
+                if (which == 0) editor.remove(PREF_CLOCK) else editor.putString(PREF_CLOCK, apps[which - 1].key)
+                editor.apply()
+            }
+            .show()
+    }
+
     // 端末本体の設定アプリを開く
     private fun openDeviceSettings() {
         try {
@@ -672,6 +709,7 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
             )
         }
+        clockRow.setOnClickListener { openClockApp() }
         box.addView(clockRow, LinearLayout.LayoutParams(match, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         box.addView(
@@ -1012,9 +1050,9 @@ class MainActivity : Activity() {
         }
     }
 
-    // 並び替え用のキー。全角英数は半角に、かなはローマ字にする（表示名そのものは変えない）
+    // 並び替え用のキー。全角英数は半角に、よくある漢字語とかなはローマ字にする（表示名そのものは変えない）
     private fun romajiKey(label: String): String {
-        val t = Normalizer.normalize(label, Normalizer.Form.NFKC).trim()
+        val t = KanjiReadings.toKana(Normalizer.normalize(label, Normalizer.Form.NFKC).trim())
         return try {
             kanaToLatin?.transliterate(t) ?: t
         } catch (_: Exception) {
@@ -1443,5 +1481,84 @@ class MediaIconView(context: Context, var type: Int) : View(context) {
             }
         }
         canvas.restore()
+    }
+}
+
+/**
+ * アプリ名によく出てくる漢字語の読み（ひらがな）。
+ * 並び替え用のローマ字キーを作るためだけに使い、表示名は変えない。
+ * 載っていない漢字はそのまま残り、「#」グループになる。足したい語は下の WORDS に追記する。
+ */
+object KanjiReadings {
+
+    private val WORDS: Map<String, String> = mapOf(
+        // 端末の基本アプリ
+        "設定" to "せってい", "電話" to "でんわ", "連絡先" to "れんらくさき", "連絡" to "れんらく",
+        "時計" to "とけい", "電卓" to "でんたく", "計算機" to "けいさんき", "計算" to "けいさん",
+        "写真" to "しゃしん", "音楽" to "おんがく", "動画" to "どうが", "映画" to "えいが",
+        "地図" to "ちず", "天気" to "てんき", "気象" to "きしょう", "辞書" to "じしょ", "辞典" to "じてん",
+        "翻訳" to "ほんやく", "検索" to "けんさく", "管理" to "かんり", "通知" to "つうち",
+        "録音" to "ろくおん", "録画" to "ろくが", "画面" to "がめん", "画像" to "がぞう",
+        "撮影" to "さつえい", "編集" to "へんしゅう", "加工" to "かこう", "共有" to "きょうゆう",
+        "診断" to "しんだん", "安全" to "あんぜん", "手帳" to "てちょう", "日記" to "にっき",
+        "予定" to "よてい", "目覚まし" to "めざまし", "懐中電灯" to "かいちゅうでんとう",
+        "電灯" to "でんとう", "方位磁針" to "ほういじしん", "文字" to "もじ", "入力" to "にゅうりょく",
+        "文書" to "ぶんしょ", "表計算" to "ひょうけいさん", "名刺" to "めいし", "手紙" to "てがみ",
+        "伝言" to "でんごん", "住所" to "じゅうしょ", "会議" to "かいぎ", "仕事" to "しごと",
+        "放送" to "ほうそう", "番組" to "ばんぐみ", "配信" to "はいしん",
+        // 端末の管理・メンテナンス系
+        "電池" to "でんち", "充電" to "じゅうでん", "省電力" to "しょうでんりょく", "容量" to "ようりょう",
+        "整理" to "せいり", "掃除" to "そうじ", "最適化" to "さいてきか", "速度" to "そくど",
+        "測定" to "そくてい", "拡大" to "かくだい", "拡張" to "かくちょう", "機能" to "きのう",
+        "更新" to "こうしん", "情報" to "じょうほう", "接続" to "せつぞく", "無線" to "むせん",
+        // 本・ニュース・学習
+        "新聞" to "しんぶん", "漫画" to "まんが", "読書" to "どくしょ", "電子" to "でんし",
+        "書籍" to "しょしゃく", "学習" to "がくしゅう", "英語" to "えいご", "日本語" to "にほんご",
+        "漢字" to "かんじ", "国語" to "こくご", "数学" to "すうがく",
+        // 乗り物・旅行
+        "乗換案内" to "のりかえあんない", "乗換" to "のりかえ", "乗り換え" to "のりかえ", "案内" to "あんない",
+        "配車" to "はいしゃ", "旅行" to "りょこう", "航空" to "こうくう", "鉄道" to "てつどう",
+        "電車" to "でんしゃ", "地下鉄" to "ちかてつ", "駅" to "えき", "路線" to "ろせん",
+        "運転" to "うんてん", "免許" to "めんきょ", "乗車" to "じょうしゃ", "切符" to "きっぷ",
+        "自転車" to "じてんしゃ", "登山" to "とざん",
+        // お金・買い物
+        "銀行" to "ぎんこう", "決済" to "けっさい", "家計簿" to "かけいぼ", "家計" to "かけい",
+        "財布" to "さいふ", "支払い" to "しはらい", "送金" to "そうきん", "証券" to "しょうけん",
+        "保険" to "ほけん", "郵便" to "ゆうびん", "買い物" to "かいもの", "注文" to "ちゅうもん",
+        "予約" to "よやく", "割引" to "わりびき", "宅配" to "たくはい", "出前" to "でまえ",
+        "無料" to "むりょう", "公式" to "こうしき", "楽天" to "らくてん", "市場" to "いちば",
+        "求人" to "きゅうじん", "不動産" to "ふどうさん",
+        // 健康・生活
+        "病院" to "びょういん", "健康" to "けんこう", "運動" to "うんどう", "歩数" to "ほすう",
+        "睡眠" to "すいみん", "体重" to "たいじゅう", "血圧" to "けつあつ", "料理" to "りょうり",
+        "家族" to "かぞく", "子供" to "こども", "育児" to "いくじ", "防災" to "ぼうさい",
+        "地震" to "じしん", "雨雲" to "あまぐも", "天文" to "てんもん", "緊急" to "きんきゅう",
+    )
+
+    private val MAX_LEN = WORDS.keys.maxOf { it.length }
+
+    // 辞書にある語を、長い語から順に探してひらがなに置き換える。無い文字はそのまま
+    fun toKana(text: String): String {
+        val sb = StringBuilder()
+        var i = 0
+        while (i < text.length) {
+            var matched = false
+            var len = minOf(MAX_LEN, text.length - i)
+            while (len >= 1) {
+                val reading = WORDS[text.substring(i, i + len)]
+                if (reading != null) {
+                    sb.append(reading)
+                    i += len
+                    matched = true
+                    break
+                }
+                len--
+            }
+            if (!matched) {
+                sb.append(text[i])
+                i++
+            }
+        }
+        return sb.toString()
     }
 }
