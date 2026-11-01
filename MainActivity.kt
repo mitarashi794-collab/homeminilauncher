@@ -77,6 +77,8 @@ class MainActivity : Activity() {
         const val PREF_TEXT = "textSize"
         const val PREF_HIDDEN = "hiddenApps"
         const val PREF_CLOCK = "clockApp"
+        const val PREF_CAL_APP = "calendarApp"
+        const val PREF_CAL_SHOW = "calendarShow"
         const val PREF_COLOR = "textColor"
         const val DEFAULT_COLOR = "#FFFFFF"
         val TEXT_SCALES = floatArrayOf(0.85f, 1.0f, 1.2f, 1.4f)
@@ -129,6 +131,7 @@ class MainActivity : Activity() {
     private lateinit var clockTime: TextClock
     private lateinit var clockDate: TextClock
     private lateinit var analogClock: AnalogClockView
+    private lateinit var calendarView: MonthCalendarView
     private val adapter = AppAdapter()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -446,6 +449,8 @@ class MainActivity : Activity() {
             "上スワイプで開くアプリ（現在: ${swipeAppLabel(SLOT_UP)}）",
             "音楽プレイヤー（現在: ${playerLabel()}）",
             "時計をタップで開くアプリ（現在: ${clockLabel()}）",
+            "ホームのカレンダー（現在: ${if (prefs.getBoolean(PREF_CAL_SHOW, true)) "表示" else "非表示"}）",
+            "カレンダーをタップで開くアプリ（現在: ${calendarLabel()}）",
             "ブラウザ（現在: $browser）",
             "非表示のアプリ（現在: ${apps.count { it.key in hiddenKeys }}件）",
             "端末の設定を開く",
@@ -460,9 +465,11 @@ class MainActivity : Activity() {
                     3 -> showSwipeAppChooser(SLOT_UP, "上スワイプで開くアプリ")
                     4 -> showPlayerChooser()
                     5 -> showClockAppChooser()
-                    6 -> showBrowserChooser()
-                    7 -> showHiddenApps()
-                    8 -> openDeviceSettings()
+                    6 -> toggleCalendar()
+                    7 -> showCalendarAppChooser()
+                    8 -> showBrowserChooser()
+                    9 -> showHiddenApps()
+                    10 -> openDeviceSettings()
                 }
             }
             .show()
@@ -534,6 +541,7 @@ class MainActivity : Activity() {
         clockTime.setTextColor(c)
         clockDate.setTextColor(alphaOf(c, 200))
         analogClock.setColor(c)
+        calendarView.setColor(c)
         slider.textColor = c
         renderFavorites()
         adapter.notifyDataSetChanged()
@@ -604,6 +612,48 @@ class MainActivity : Activity() {
             .setItems(labels) { _, which ->
                 val editor = prefs.edit()
                 if (which == 0) editor.remove(PREF_CLOCK) else editor.putString(PREF_CLOCK, apps[which - 1].key)
+                editor.apply()
+            }
+            .show()
+    }
+
+    // ホームのカレンダーの表示/非表示を切り替える
+    private fun toggleCalendar() {
+        val show = !prefs.getBoolean(PREF_CAL_SHOW, true)
+        prefs.edit().putBoolean(PREF_CAL_SHOW, show).apply()
+        calendarView.visibility = if (show) View.VISIBLE else View.GONE
+    }
+
+    // カレンダーをタップしたときに開くアプリ。未設定のときは端末のカレンダー（今日の表示）
+    private fun openCalendarApp() {
+        val key = prefs.getString(PREF_CAL_APP, null)
+        val app = apps.firstOrNull { it.key == key }
+        if (app != null) {
+            launch(app)
+            return
+        }
+        try {
+            startActivity(
+                Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_CALENDAR)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+        } catch (_: Exception) {
+            Toast.makeText(this, "設定でカレンダーを開くアプリを選んでください", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun calendarLabel(): String {
+        val key = prefs.getString(PREF_CAL_APP, null)
+        return apps.firstOrNull { it.key == key }?.label ?: "自動"
+    }
+
+    private fun showCalendarAppChooser() {
+        val labels = (listOf("自動（端末のカレンダー）") + apps.map { it.label }).toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("カレンダーをタップで開くアプリ")
+            .setItems(labels) { _, which ->
+                val editor = prefs.edit()
+                if (which == 0) editor.remove(PREF_CAL_APP) else editor.putString(PREF_CAL_APP, apps[which - 1].key)
                 editor.apply()
             }
             .show()
@@ -715,6 +765,17 @@ class MainActivity : Activity() {
         box.addView(
             buildMusicCard(),
             LinearLayout.LayoutParams(match, dp(116)).apply { topMargin = dp(16) },
+        )
+
+        // 音楽カードの下に今月のカレンダー。タップでカレンダーアプリを開く
+        calendarView = MonthCalendarView(this).apply {
+            setColor(uiColor)
+            visibility = if (prefs.getBoolean(PREF_CAL_SHOW, true)) View.VISIBLE else View.GONE
+            setOnClickListener { openCalendarApp() }
+        }
+        box.addView(
+            calendarView,
+            LinearLayout.LayoutParams(match, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) },
         )
         return box
     }
@@ -1315,6 +1376,161 @@ class MainActivity : Activity() {
 
 // 曲名を読むには「通知へのアクセス」を受け取るサービスが必要。中身は空でよい。
 class MediaListenerService : NotificationListenerService()
+
+// ホームに置く今月のカレンダー（日曜始まり）。今日は丸で強調する。
+// 画面に戻ってきたときに月や日付が変わっていても、描き直しと高さの計算をやり直す。
+class MonthCalendarView(context: Context) : View(context) {
+
+    private val density = resources.displayMetrics.density
+    private val rowH = 24f * density
+    private var color = Color.WHITE
+
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+        textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 13f, resources.displayMetrics)
+    }
+    private val holidayColor = Color.rgb(255, 138, 128)
+
+    // 祝日は月ごとに一度だけ計算する
+    private var holidayYear = -1
+    private var holidayMonth = -1
+    private var holidays: Set<Int> = emptySet()
+
+    private val todayPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(255, 193, 7)
+        style = Paint.Style.FILL
+    }
+
+    fun setColor(c: Int) {
+        color = c
+        invalidate()
+    }
+
+    // 今月の1日が日曜から数えて何番目か（0=日曜）と、その月の日数
+    private fun firstOffset(cal: Calendar): Int {
+        val first = cal.clone() as Calendar
+        first.set(Calendar.DAY_OF_MONTH, 1)
+        return first.get(Calendar.DAY_OF_WEEK) - 1
+    }
+
+    private fun weeks(cal: Calendar): Int =
+        (firstOffset(cal) + cal.getActualMaximum(Calendar.DAY_OF_MONTH) + 6) / 7
+
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val h = ((1 + weeks(Calendar.getInstance())) * rowH).toInt()
+        setMeasuredDimension(MeasureSpec.getSize(widthMeasureSpec), h)
+    }
+
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        if (visibility == View.VISIBLE) {
+            requestLayout()
+            invalidate()
+        }
+    }
+
+    // 行の中央に文字を置いたときのベースライン
+    private fun baseline(cy: Float): Float = cy - (textPaint.descent() + textPaint.ascent()) / 2f
+
+    override fun onDraw(canvas: Canvas) {
+        val cal = Calendar.getInstance()
+        val today = cal.get(Calendar.DAY_OF_MONTH)
+        val offset = firstOffset(cal)
+        val days = cal.getActualMaximum(Calendar.DAY_OF_MONTH)
+        val colW = width / 7f
+
+        val year = cal.get(Calendar.YEAR)
+        val month = cal.get(Calendar.MONTH) + 1
+        if (year != holidayYear || month != holidayMonth) {
+            holidays = JapaneseHolidays.daysIn(year, month)
+            holidayYear = year
+            holidayMonth = month
+        }
+
+        val names = "日月火水木金土"
+        textPaint.color = Color.argb(150, Color.red(color), Color.green(color), Color.blue(color))
+        for (i in 0 until 7) {
+            canvas.drawText(names[i].toString(), (i + 0.5f) * colW, baseline(rowH / 2f), textPaint)
+        }
+
+        for (d in 1..days) {
+            val idx = offset + d - 1
+            val col = idx % 7
+            val cx = (col + 0.5f) * colW
+            val cy = (1 + idx / 7 + 0.5f) * rowH
+            if (d == today) {
+                canvas.drawCircle(cx, cy, rowH * 0.42f, todayPaint)
+                textPaint.color = Color.BLACK
+            } else {
+                textPaint.color = when {
+                    d in holidays || col == 0 -> holidayColor
+                    col == 6 -> Color.rgb(130, 177, 255)
+                    else -> color
+                }
+            }
+            canvas.drawText(d.toString(), cx, baseline(cy), textPaint)
+        }
+    }
+}
+
+// 日本の祝日（内閣府の定め）を端末内で計算する。ネットや権限は使わない。
+// 春分・秋分の日は 1980〜2099 年に使える近似式。2020・2021 年のオリンピック特例は入れていない。
+object JapaneseHolidays {
+
+    private fun key(month: Int, day: Int) = month * 100 + day
+
+    private fun cal(year: Int, month: Int, day: Int): Calendar =
+        Calendar.getInstance().apply {
+            clear()
+            set(year, month - 1, day)
+        }
+
+    // その月の第 n 月曜日の日付
+    private fun nthMonday(year: Int, month: Int, n: Int): Int {
+        val dow = cal(year, month, 1).get(Calendar.DAY_OF_WEEK)
+        return 1 + (Calendar.MONDAY - dow + 7) % 7 + 7 * (n - 1)
+    }
+
+    private fun equinox(year: Int, base: Double): Int =
+        (base + 0.242194 * (year - 1980) - ((year - 1980) / 4)).toInt()
+
+    // 指定した月の祝日（振替休日・国民の休日を含む）の「日」の集まり
+    fun daysIn(year: Int, month: Int): Set<Int> {
+        val base = mutableSetOf(
+            key(1, 1), key(1, nthMonday(year, 1, 2)), key(2, 11), key(2, 23),
+            key(3, equinox(year, 20.8431)), key(4, 29), key(5, 3), key(5, 4), key(5, 5),
+            key(7, nthMonday(year, 7, 3)), key(8, 11), key(9, nthMonday(year, 9, 3)),
+            key(9, equinox(year, 23.2488)), key(10, nthMonday(year, 10, 2)), key(11, 3), key(11, 23),
+        )
+        val all = base.toMutableSet()
+
+        // 振替休日: 祝日が日曜なら、次に祝日でない日が休みになる
+        for (k in base.sorted()) {
+            val c = cal(year, k / 100, k % 100)
+            if (c.get(Calendar.DAY_OF_WEEK) != Calendar.SUNDAY) continue
+            do {
+                c.add(Calendar.DAY_OF_MONTH, 1)
+            } while (key(c.get(Calendar.MONTH) + 1, c.get(Calendar.DAY_OF_MONTH)) in all)
+            all.add(key(c.get(Calendar.MONTH) + 1, c.get(Calendar.DAY_OF_MONTH)))
+        }
+
+        // 国民の休日: 前日と翌日が祝日にはさまれた平日
+        val c = cal(year, month, 1)
+        for (d in 1..c.getActualMaximum(Calendar.DAY_OF_MONTH)) {
+            val day = cal(year, month, d)
+            val prev = (day.clone() as Calendar).apply { add(Calendar.DAY_OF_MONTH, -1) }
+            val next = (day.clone() as Calendar).apply { add(Calendar.DAY_OF_MONTH, 1) }
+            fun k(x: Calendar) = key(x.get(Calendar.MONTH) + 1, x.get(Calendar.DAY_OF_MONTH))
+            if (k(day) !in all && day.get(Calendar.DAY_OF_WEEK) != Calendar.SUNDAY &&
+                k(prev) in all && k(next) in all
+            ) {
+                all.add(k(day))
+            }
+        }
+
+        return all.filter { it / 100 == month }.map { it % 100 }.toSet()
+    }
+}
 
 // ホームに置くアナログ時計（秒針つき）。画面に見えている間だけ毎秒描き直す。
 class AnalogClockView(context: Context) : View(context) {
