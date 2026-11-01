@@ -51,6 +51,7 @@ import android.widget.ListView
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import android.os.Build
 import java.text.Collator
 import java.text.Normalizer
 import kotlin.math.abs
@@ -63,6 +64,7 @@ class MainActivity : Activity() {
         val activityName: String,
         val group: Int, // 0..25 = A..Z, 26 = それ以外(#)
         val original: String, // 端末上の本来のアプリ名（label は変更後の表示名）
+        val sortKey: String = label, // 並び替え・グルーピング用のローマ字キー（表示には使わない）
     ) {
         val key: String get() = "$packageName/$activityName"
     }
@@ -73,6 +75,7 @@ class MainActivity : Activity() {
         const val PREF_BROWSER = "browserPkg"
         const val PREF_PLAYER = "playerPkg"
         const val PREF_TEXT = "textSize"
+        const val PREF_HIDDEN = "hiddenApps"
         const val PREF_COLOR = "textColor"
         const val DEFAULT_COLOR = "#FFFFFF"
         val TEXT_SCALES = floatArrayOf(0.85f, 1.0f, 1.2f, 1.4f)
@@ -81,7 +84,11 @@ class MainActivity : Activity() {
 
     private val match = ViewGroup.LayoutParams.MATCH_PARENT
 
-    private var apps: List<AppItem> = emptyList()
+    private var apps: List<AppItem> = emptyList() // 非表示のアプリも含む全アプリ
+    // 一覧・検索から隠すアプリ（スワイプ起動や音楽プレイヤーには引き続き使える）
+    private val hiddenKeys: MutableSet<String> by lazy {
+        (prefs.getStringSet(PREF_HIDDEN, null) ?: emptySet()).toMutableSet()
+    }
     private var shown: List<AppItem> = emptyList() // 検索で絞り込んだ後の表示リスト
     private val favorites = mutableListOf<String>()
     private val prefs by lazy { getSharedPreferences("launcher", MODE_PRIVATE) }
@@ -310,7 +317,8 @@ class MainActivity : Activity() {
     // 検索語を含むアプリ名だけに絞る（大文字小文字は区別しない）。検索中はスライダーを隠す
     private fun applyFilter() {
         val q = searchBox.text.toString().trim()
-        shown = if (q.isEmpty()) apps else apps.filter { it.label.contains(q, ignoreCase = true) }
+        val visible = apps.filter { it.key !in hiddenKeys }
+        shown = if (q.isEmpty()) visible else visible.filter { it.label.contains(q, ignoreCase = true) }
         slider.visibility = if (q.isEmpty()) View.VISIBLE else View.GONE
         adapter.notifyDataSetChanged()
     }
@@ -437,6 +445,7 @@ class MainActivity : Activity() {
             "上スワイプで開くアプリ（現在: ${swipeAppLabel(SLOT_UP)}）",
             "音楽プレイヤー（現在: ${playerLabel()}）",
             "ブラウザ（現在: $browser）",
+            "非表示のアプリ（現在: ${apps.count { it.key in hiddenKeys }}件）",
             "端末の設定を開く",
         )
         AlertDialog.Builder(this)
@@ -449,7 +458,8 @@ class MainActivity : Activity() {
                     3 -> showSwipeAppChooser(SLOT_UP, "上スワイプで開くアプリ")
                     4 -> showPlayerChooser()
                     5 -> showBrowserChooser()
-                    6 -> openDeviceSettings()
+                    6 -> showHiddenApps()
+                    7 -> openDeviceSettings()
                 }
             }
             .show()
@@ -974,11 +984,12 @@ class MainActivity : Activity() {
                 val pkg = it.activityInfo.packageName
                 val act = it.activityInfo.name
                 val label = namePrefs.getString("$pkg/$act", null) ?: original
-                AppItem(label, pkg, act, groupOf(label), original)
+                val key = romajiKey(label)
+                AppItem(label, pkg, act, groupOf(key), original, key)
             }
             .sortedWith(
                 Comparator<AppItem> { a, b -> a.group.compareTo(b.group) }
-                    .thenComparator { a, b -> collator.compare(a.label, b.label) },
+                    .thenComparator { a, b -> collator.compare(a.sortKey, b.sortKey) },
             )
         applyFilter()
 
@@ -986,12 +997,33 @@ class MainActivity : Activity() {
         if (apps.isNotEmpty()) {
             val valid = apps.map { it.key }.toSet()
             if (favorites.retainAll(valid)) saveFavorites()
+            if (hiddenKeys.retainAll(valid)) saveHidden()
         }
         renderFavorites()
     }
 
-    private fun groupOf(label: String): Int {
-        val c = label.firstOrNull()?.uppercaseChar() ?: return 26
+    // ひらがな・カタカナをローマ字に変換する（漢字はそのまま残る）。API 24 未満や失敗時は変換なし
+    private val kanaToLatin: android.icu.text.Transliterator? by lazy {
+        if (Build.VERSION.SDK_INT < 24) null
+        else try {
+            android.icu.text.Transliterator.getInstance("Hiragana-Latin; Katakana-Latin; Latin-ASCII")
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // 並び替え用のキー。全角英数は半角に、かなはローマ字にする（表示名そのものは変えない）
+    private fun romajiKey(label: String): String {
+        val t = Normalizer.normalize(label, Normalizer.Form.NFKC).trim()
+        return try {
+            kanaToLatin?.transliterate(t) ?: t
+        } catch (_: Exception) {
+            t
+        }
+    }
+
+    private fun groupOf(key: String): Int {
+        val c = key.firstOrNull()?.uppercaseChar() ?: return 26
         return if (c in 'A'..'Z') c - 'A' else 26
     }
 
@@ -1065,40 +1097,99 @@ class MainActivity : Activity() {
         val isFav = app.key in favorites
         val isRight = prefs.getString(SLOT_RIGHT, null) == app.key
         val isUp = prefs.getString(SLOT_UP, null) == app.key
-        val labels = arrayOf(
-            if (isFav) "お気に入りから外す" else "お気に入りに追加",
-            "名前を変更",
-            if (isRight) "右スワイプの設定を解除" else "右スワイプで開くアプリにする",
-            if (isUp) "上スワイプの設定を解除" else "上スワイプで開くアプリにする",
-            "アプリ情報",
+        showActionMenu(
+            app,
+            listOf(
+                (if (isFav) "お気に入りから外す" else "お気に入りに追加") to { toggleFavorite(app) },
+                "名前を変更" to { showRenameDialog(app) },
+                (if (isRight) "右スワイプの設定を解除" else "右スワイプで開くアプリにする") to
+                    { toggleSwipeSlot(SLOT_RIGHT, app) },
+                (if (isUp) "上スワイプの設定を解除" else "上スワイプで開くアプリにする") to
+                    { toggleSwipeSlot(SLOT_UP, app) },
+                "非表示にする" to { hideApp(app) },
+                "アプリ情報" to { openAppInfo(app) },
+            ),
         )
-        AlertDialog.Builder(this)
-            .setTitle(app.label)
-            .setItems(labels) { _, which ->
-                when (which) {
-                    0 -> toggleFavorite(app)
-                    1 -> showRenameDialog(app)
-                    2 -> toggleSwipeSlot(SLOT_RIGHT, app)
-                    3 -> toggleSwipeSlot(SLOT_UP, app)
-                    4 -> openAppInfo(app)
-                }
-            }
-            .show()
     }
 
     private fun showFavoriteMenu(app: AppItem) {
-        val labels = arrayOf("上へ移動", "お気に入りから外す", "名前を変更", "アプリ情報")
+        showActionMenu(
+            app,
+            listOf(
+                "上へ移動" to { moveUp(app) },
+                "お気に入りから外す" to { toggleFavorite(app) },
+                "名前を変更" to { showRenameDialog(app) },
+                "非表示にする" to { hideApp(app) },
+                "アプリ情報" to { openAppInfo(app) },
+            ),
+        )
+    }
+
+    // 長押しメニューの共通部分。ユーザーアプリにはアンインストールを末尾に足す
+    private fun showActionMenu(app: AppItem, actions: List<Pair<String, () -> Unit>>) {
+        val all = if (isUninstallable(app)) actions + ("アンインストール" to { uninstall(app) }) else actions
         AlertDialog.Builder(this)
             .setTitle(app.label)
-            .setItems(labels) { _, which ->
-                when (which) {
-                    0 -> moveUp(app)
-                    1 -> toggleFavorite(app)
-                    2 -> showRenameDialog(app)
-                    3 -> openAppInfo(app)
-                }
-            }
+            .setItems(all.map { it.first }.toTypedArray()) { _, which -> all[which].second() }
             .show()
+    }
+
+    // ---- 非表示・アンインストール ----
+
+    private fun saveHidden() {
+        prefs.edit().putStringSet(PREF_HIDDEN, hiddenKeys.toSet()).apply()
+    }
+
+    private fun hideApp(app: AppItem) {
+        hiddenKeys.add(app.key)
+        saveHidden()
+        if (favorites.remove(app.key)) saveFavorites()
+        loadApps()
+        android.widget.Toast.makeText(
+            this, "「${app.label}」を非表示にしました（設定から戻せます）", android.widget.Toast.LENGTH_LONG,
+        ).show()
+    }
+
+    private fun showHiddenApps() {
+        val list = apps.filter { it.key in hiddenKeys }
+        if (list.isEmpty()) {
+            AlertDialog.Builder(this)
+                .setTitle("非表示のアプリ")
+                .setMessage("非表示にしているアプリはありません。")
+                .setPositiveButton("閉じる", null)
+                .show()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("タップで表示に戻す")
+            .setItems(list.map { it.label }.toTypedArray()) { _, which ->
+                hiddenKeys.remove(list[which].key)
+                saveHidden()
+                loadApps()
+                showHiddenApps() // 続けて戻せるよう開き直す（残りが無ければメッセージ表示）
+            }
+            .setNegativeButton("閉じる", null)
+            .show()
+    }
+
+    // 端末に最初から入っているアプリ（システムアプリ）はアンインストールできない
+    private fun isUninstallable(app: AppItem): Boolean = try {
+        val flags = packageManager.getApplicationInfo(app.packageName, 0).flags
+        flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM == 0
+    } catch (_: Exception) {
+        false
+    }
+
+    // システムの確認ダイアログが出る。完了後は onResume の loadApps() で一覧から消える
+    @Suppress("DEPRECATION")
+    private fun uninstall(app: AppItem) {
+        val intent = Intent(Intent.ACTION_DELETE)
+            .setData(Uri.fromParts("package", app.packageName, null))
+        try {
+            startActivity(intent)
+        } catch (_: ActivityNotFoundException) {
+        } catch (_: SecurityException) {
+        }
     }
 
     // アプリ名の変更。空にするか「元に戻す」で、端末上の本来の名前に戻る

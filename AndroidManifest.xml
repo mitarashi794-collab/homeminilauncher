@@ -4,6 +4,9 @@
     <!-- 下スワイプで通知パネルを開くために必要 -->
     <uses-permission android:name="android.permission.EXPAND_STATUS_BAR" />
 
+    <!-- アプリのアンインストール画面を開くために必要（Android 9以降） -->
+    <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+
     <!-- Android 11以降でインストール済みアプリ一覧を取得するために必要 -->
     <queries>
         <!-- ブラウザ一覧の取得（設定の選択肢）用 -->
