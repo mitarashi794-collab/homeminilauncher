@@ -24,6 +24,13 @@ class AlphabetSlider(context: Context) : View(context) {
     var onSelect: ((Int) -> Unit)? = null
     var onRelease: (() -> Unit)? = null
 
+    // 通常の文字の色（設定の「文字の色」）。選択中の文字は強調色のまま
+    var textColor: Int = Color.WHITE
+        set(value) {
+            field = value
+            invalidate()
+        }
+
     private var active = -1
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -52,7 +59,7 @@ class AlphabetSlider(context: Context) : View(context) {
         paint.textSize = minOf(step * 0.7f, maxTextPx)
         val centerX = width / 2f
         for ((i, letter) in LETTERS.withIndex()) {
-            paint.color = if (i == active) Color.rgb(255, 193, 7) else Color.WHITE
+            paint.color = if (i == active) Color.rgb(255, 193, 7) else textColor
             paint.isFakeBoldText = i == active
             val centerY = step * i + step / 2f
             val baseline = centerY - (paint.ascent() + paint.descent()) / 2f

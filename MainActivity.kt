@@ -8,7 +8,13 @@ import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Path
+import android.graphics.RectF
+import android.graphics.drawable.GradientDrawable
 import android.os.Handler
+import android.widget.ImageView
 import android.os.Looper
 import android.service.notification.NotificationListenerService
 import android.view.KeyEvent
@@ -46,6 +52,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import java.text.Collator
+import java.text.Normalizer
 import kotlin.math.abs
 
 class MainActivity : Activity() {
@@ -64,7 +71,10 @@ class MainActivity : Activity() {
         const val SLOT_RIGHT = "swipeRight"
         const val SLOT_UP = "swipeUp"
         const val PREF_BROWSER = "browserPkg"
+        const val PREF_PLAYER = "playerPkg"
         const val PREF_TEXT = "textSize"
+        const val PREF_COLOR = "textColor"
+        const val DEFAULT_COLOR = "#FFFFFF"
         val TEXT_SCALES = floatArrayOf(0.85f, 1.0f, 1.2f, 1.4f)
         val TEXT_LABELS = arrayOf("小", "標準", "大", "特大")
     }
@@ -77,6 +87,26 @@ class MainActivity : Activity() {
     private val prefs by lazy { getSharedPreferences("launcher", MODE_PRIVATE) }
     private val namePrefs by lazy { getSharedPreferences("names", MODE_PRIVATE) } // 変更したアプリ名
 
+    // 文字の色（設定でカラーコードを入力。初期値は白 #FFFFFF）
+    private val uiColor: Int get() = Color.parseColor(currentColorCode())
+
+    private fun alphaOf(color: Int, alpha: Int) =
+        Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))
+
+    // 全角・小文字・先頭の # なし・3桁（#FFF）にも対応して「#RRGGBB」に整える。読み取れなければ null
+    private fun normalizeColor(raw: String): String? {
+        var t = Normalizer.normalize(raw, Normalizer.Form.NFKC)
+            .filter { !it.isWhitespace() }
+            .removePrefix("#")
+            .uppercase()
+        if (t.length == 3) t = t.map { "$it$it" }.joinToString("")
+        if (t.length != 6 || !t.all { it in '0'..'9' || it in 'A'..'F' }) return null
+        return "#$t"
+    }
+
+    private fun currentColorCode(): String =
+        normalizeColor(prefs.getString(PREF_COLOR, null) ?: DEFAULT_COLOR) ?: DEFAULT_COLOR
+
     private val textIndex: Int get() = prefs.getInt(PREF_TEXT, 1).coerceIn(0, TEXT_SCALES.size - 1)
     private val textScale: Float get() = TEXT_SCALES[textIndex]
 
@@ -87,6 +117,10 @@ class MainActivity : Activity() {
     private lateinit var searchBox: EditText
     private lateinit var slider: AlphabetSlider
     private lateinit var bubble: TextView
+    private lateinit var gearView: TextView
+    private lateinit var clockTime: TextClock
+    private lateinit var clockDate: TextClock
+    private lateinit var analogClock: AnalogClockView
     private val adapter = AppAdapter()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -139,10 +173,10 @@ class MainActivity : Activity() {
             clipToPadding = false
             adapter = this@MainActivity.adapter
             onItemClickListener = AdapterView.OnItemClickListener { _, _, position, _ ->
-                if (position < shown.size) launch(shown[position]) else webSearch(query())
+                launch(shown[position])
             }
             onItemLongClickListener = AdapterView.OnItemLongClickListener { _, _, position, _ ->
-                if (position < shown.size) showListMenu(shown[position])
+                showListMenu(shown[position])
                 true
             }
         }
@@ -208,7 +242,7 @@ class MainActivity : Activity() {
         )
 
         // アプリ一覧の右下の歯車（設定）。一覧ページの上にだけ載っている
-        val gear = TextView(this).apply {
+        gearView = TextView(this).apply {
             text = "⚙︎"
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 28f)
@@ -217,7 +251,7 @@ class MainActivity : Activity() {
             setOnClickListener { showSettings() }
         }
         appsPage.addView(
-            gear,
+            gearView,
             FrameLayout.LayoutParams(dp(48), dp(48), Gravity.BOTTOM or Gravity.END)
                 .apply { rightMargin = dp(4); bottomMargin = dp(8) },
         )
@@ -230,16 +264,17 @@ class MainActivity : Activity() {
         root.addView(pager, FrameLayout.LayoutParams(match, match))
 
         setContentView(root)
+        applyUiColor()
     }
 
     override fun onResume() {
         super.onResume()
         loadApps()
-        handler.post(musicTicker)
+        startMusic()
     }
 
     override fun onPause() {
-        handler.removeCallbacks(musicTicker)
+        stopMusic()
         super.onPause()
     }
 
@@ -397,8 +432,10 @@ class MainActivity : Activity() {
         val browser = if (pkg == null) "システム標準" else appLabelOf(pkg)
         val labels = arrayOf(
             "文字の大きさ（現在: ${TEXT_LABELS[textIndex]}）",
+            "文字の色（現在: ${currentColorCode()}）",
             "右スワイプで開くアプリ（現在: ${swipeAppLabel(SLOT_RIGHT)}）",
             "上スワイプで開くアプリ（現在: ${swipeAppLabel(SLOT_UP)}）",
+            "音楽プレイヤー（現在: ${playerLabel()}）",
             "ブラウザ（現在: $browser）",
             "端末の設定を開く",
         )
@@ -407,10 +444,12 @@ class MainActivity : Activity() {
             .setItems(labels) { _, which ->
                 when (which) {
                     0 -> showTextSizeChooser()
-                    1 -> showSwipeAppChooser(SLOT_RIGHT, "右スワイプで開くアプリ")
-                    2 -> showSwipeAppChooser(SLOT_UP, "上スワイプで開くアプリ")
-                    3 -> showBrowserChooser()
-                    4 -> openDeviceSettings()
+                    1 -> showColorDialog(currentColorCode())
+                    2 -> showSwipeAppChooser(SLOT_RIGHT, "右スワイプで開くアプリ")
+                    3 -> showSwipeAppChooser(SLOT_UP, "上スワイプで開くアプリ")
+                    4 -> showPlayerChooser()
+                    5 -> showBrowserChooser()
+                    6 -> openDeviceSettings()
                 }
             }
             .show()
@@ -434,6 +473,59 @@ class MainActivity : Activity() {
         adapter.notifyDataSetChanged()
     }
 
+    // 文字の色: カラーコード（例 #FFFFFF）を入力。不正な入力は理由を出して入力し直せる
+    private fun showColorDialog(prefill: String) {
+        val input = EditText(this).apply {
+            setText(prefill)
+            setSelection(text.length)
+            hint = DEFAULT_COLOR
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        }
+        val box = FrameLayout(this).apply {
+            setPadding(dp(20), dp(8), dp(20), 0)
+            addView(input)
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("文字の色")
+            .setMessage("カラーコードを入力します（例: #FFFFFF）。初期値は白です。")
+            .setView(box)
+            .setPositiveButton("変更") { _, _ -> setUiColor(input.text.toString()) }
+            .setNegativeButton("キャンセル", null)
+            .setNeutralButton("白に戻す") { _, _ -> setUiColor(DEFAULT_COLOR) }
+            .create()
+        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
+        dialog.show()
+    }
+
+    private fun setUiColor(raw: String) {
+        val code = normalizeColor(raw)
+        if (code == null) {
+            Toast.makeText(this, "6桁のカラーコードで入力してください（例: #FFFFFF）", Toast.LENGTH_LONG).show()
+            showColorDialog(raw)
+            return
+        }
+        prefs.edit().putString(PREF_COLOR, code).apply()
+        applyUiColor()
+    }
+
+    // 設定した色を、ランチャーの文字（お気に入り・一覧・検索欄・時計・スライダー・歯車）にすぐ反映する。
+    // 音楽カードは、ジャケットの色に合わせて自動で白/黒を切り替えるので対象外。
+    private fun applyUiColor() {
+        val c = uiColor
+        searchBox.setTextColor(c)
+        searchBox.setHintTextColor(alphaOf(c, 140))
+        searchBox.setBackgroundColor(alphaOf(c, 40))
+        bubble.setTextColor(c)
+        gearView.setTextColor(c)
+        clockTime.setTextColor(c)
+        clockDate.setTextColor(alphaOf(c, 200))
+        analogClock.setColor(c)
+        slider.textColor = c
+        renderFavorites()
+        adapter.notifyDataSetChanged()
+    }
+
     private fun swipeAppLabel(slot: String): String {
         val key = prefs.getString(slot, null)
         return apps.firstOrNull { it.key == key }?.label ?: "未設定"
@@ -447,6 +539,25 @@ class MainActivity : Activity() {
                 val editor = prefs.edit()
                 if (which == 0) editor.remove(slot) else editor.putString(slot, apps[which - 1].key)
                 editor.apply()
+            }
+            .show()
+    }
+
+    private fun playerLabel(): String {
+        val pkg = selectedPlayer ?: return "自動"
+        return apps.firstOrNull { it.packageName == pkg }?.label ?: pkg
+    }
+
+    // ホームの音楽カードが操作するアプリを選ぶ（「自動」は再生中のアプリ）
+    private fun showPlayerChooser() {
+        val labels = (listOf("自動（再生中のアプリ）") + apps.map { it.label }).toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("音楽プレイヤー")
+            .setItems(labels) { _, which ->
+                val editor = prefs.edit()
+                if (which == 0) editor.remove(PREF_PLAYER) else editor.putString(PREF_PLAYER, apps[which - 1].packageName)
+                editor.apply()
+                refreshSessions()
             }
             .show()
     }
@@ -481,16 +592,40 @@ class MainActivity : Activity() {
     // ---- ホームの時計（アナログ + デジタル）と音楽プレイヤー ----
 
     private val handler = Handler(Looper.getMainLooper())
-    private val musicTicker = object : Runnable {
-        override fun run() {
-            refreshMusic()
-            handler.postDelayed(this, 1000)
-        }
-    }
+
+    private lateinit var musicAlbum: TextView
     private lateinit var musicTitle: TextView
     private lateinit var musicArtist: TextView
-    private lateinit var playButton: TextView
+    private lateinit var artView: ImageView
+    private lateinit var fadeView: View
+    private lateinit var cardBg: GradientDrawable
+    private lateinit var fadeBg: GradientDrawable
+    private lateinit var playIcon: MediaIconView
+    private lateinit var controlIcons: List<MediaIconView>
     private var currentController: MediaController? = null
+    private var artToken = 0
+    private var sessionsListenerRegistered = false
+
+    private val listenerComponent by lazy { ComponentName(this, MediaListenerService::class.java) }
+    private val sessionManager by lazy { getSystemService(MediaSessionManager::class.java) }
+
+    // 操作する音楽アプリ（設定で選ぶ）。null のときは「自動」＝再生中のアプリ
+    private val selectedPlayer: String? get() = prefs.getString(PREF_PLAYER, null)
+
+    private val sessionsListener = MediaSessionManager.OnActiveSessionsChangedListener { list ->
+        pickController(list ?: emptyList())
+    }
+
+    private val controllerCallback = object : MediaController.Callback() {
+        override fun onMetadataChanged(metadata: MediaMetadata?) = showTrack(metadata)
+
+        override fun onPlaybackStateChanged(state: PlaybackState?) {
+            showPlaying(state?.state == PlaybackState.STATE_PLAYING)
+            if (selectedPlayer == null) refreshSessions() // 自動のときは、再生中のアプリに追従する
+        }
+
+        override fun onSessionDestroyed() = refreshSessions()
+    }
 
     private fun buildHomeTop(): View {
         val box = LinearLayout(this).apply {
@@ -503,26 +638,25 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), 0, 0, 0)
         }
-        digital.addView(
-            TextClock(this).apply {
-                format24Hour = "HH:mm"
-                format12Hour = "HH:mm"
-                setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 48f)
-            },
-        )
-        digital.addView(
-            TextClock(this).apply {
-                format24Hour = "M月d日（E）"
-                format12Hour = "M月d日（E）"
-                setTextColor(Color.argb(200, 255, 255, 255))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            },
-        )
+        clockTime = TextClock(this).apply {
+            format24Hour = "HH:mm"
+            format12Hour = "HH:mm"
+            setTextColor(uiColor)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 48f)
+        }
+        digital.addView(clockTime)
+        clockDate = TextClock(this).apply {
+            format24Hour = "M月d日（E）"
+            format12Hour = "M月d日（E）"
+            setTextColor(alphaOf(uiColor, 200))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+        }
+        digital.addView(clockDate)
+        analogClock = AnalogClockView(this)
         val clockRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(AnalogClockView(this@MainActivity), LinearLayout.LayoutParams(dp(120), dp(120)))
+            addView(analogClock, LinearLayout.LayoutParams(dp(120), dp(120)))
             addView(
                 digital,
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
@@ -530,103 +664,272 @@ class MainActivity : Activity() {
         }
         box.addView(clockRow, LinearLayout.LayoutParams(match, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        // 音楽: 曲名とアーティスト、前へ / 再生・一時停止 / 次へ
-        musicTitle = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            setSingleLine(true)
-            ellipsize = TextUtils.TruncateAt.END
-        }
-        musicArtist = TextView(this).apply {
-            setTextColor(Color.argb(170, 255, 255, 255))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setSingleLine(true)
-            ellipsize = TextUtils.TruncateAt.END
-        }
-        val info = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(musicTitle)
-            addView(musicArtist)
-            setOnClickListener { onMusicInfoClick() }
-        }
-        playButton = mediaButton("\u25B6\uFE0E", KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
-        val musicRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(info, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(
-                mediaButton("\u25C0\u25C0\uFE0E", KeyEvent.KEYCODE_MEDIA_PREVIOUS),
-                LinearLayout.LayoutParams(dp(48), dp(48)),
-            )
-            addView(playButton, LinearLayout.LayoutParams(dp(48), dp(48)))
-            addView(
-                mediaButton("\u25B6\u25B6\uFE0E", KeyEvent.KEYCODE_MEDIA_NEXT),
-                LinearLayout.LayoutParams(dp(48), dp(48)),
-            )
-        }
         box.addView(
-            musicRow,
-            LinearLayout.LayoutParams(match, ViewGroup.LayoutParams.WRAP_CONTENT)
-                .apply { topMargin = dp(16) },
+            buildMusicCard(),
+            LinearLayout.LayoutParams(match, dp(116)).apply { topMargin = dp(16) },
         )
         return box
     }
 
-    private fun mediaButton(label: String, keyCode: Int): TextView =
-        TextView(this).apply {
-            text = label
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
-            gravity = Gravity.CENTER
-            setOnClickListener { sendMediaKey(keyCode) }
+    // 音楽カード: 左に曲情報と操作ボタン、右にジャケット（左端はカードの色に溶ける）。
+    // カードの色はジャケットの平均色、文字とボタンは明るさに合わせて白/黒を切り替える
+    private fun buildMusicCard(): View {
+        val h = dp(116)
+        cardBg = GradientDrawable().apply { cornerRadius = dp(10).toFloat() }
+        val card = FrameLayout(this).apply {
+            background = cardBg
+            clipToOutline = true
         }
 
-    // 再生中のアプリに、イヤホンのボタンと同じ「メディアキー」を送る（特別な許可は不要）
+        artView = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            visibility = View.GONE
+        }
+        card.addView(artView, FrameLayout.LayoutParams(h, h, Gravity.END))
+
+        fadeBg = GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, intArrayOf(0, 0))
+        fadeView = View(this).apply {
+            background = fadeBg
+            visibility = View.GONE
+        }
+        val fadeWidth = (h * 0.6f).toInt()
+        card.addView(
+            fadeView,
+            FrameLayout.LayoutParams(fadeWidth, h, Gravity.END).apply { marginEnd = h - fadeWidth },
+        )
+
+        fun label(sizeSp: Float) = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp)
+            setSingleLine(true)
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        musicAlbum = label(11f)
+        musicTitle = label(18f)
+        musicArtist = label(14f)
+        val texts = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(10), dp(96), 0)
+            addView(musicAlbum)
+            addView(musicTitle)
+            addView(musicArtist)
+            setOnClickListener { onMusicInfoClick() }
+        }
+        card.addView(texts, FrameLayout.LayoutParams(match, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP))
+
+        fun icon(type: Int, onClick: () -> Unit) = MediaIconView(this, type).apply {
+            setOnClickListener { onClick() }
+        }
+        val volDown = icon(MediaIconView.VOL_DOWN) { adjustVolume(AudioManager.ADJUST_LOWER) }
+        val prev = icon(MediaIconView.PREV) { mediaAction(MediaIconView.PREV) }
+        playIcon = icon(MediaIconView.PLAY) { mediaAction(MediaIconView.PLAY) }
+        val next = icon(MediaIconView.NEXT) { mediaAction(MediaIconView.NEXT) }
+        val volUp = icon(MediaIconView.VOL_UP) { adjustVolume(AudioManager.ADJUST_RAISE) }
+        controlIcons = listOf(volDown, prev, playIcon, next, volUp)
+        val controls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(8), 0, 0, dp(4))
+            for (v in controlIcons) addView(v, LinearLayout.LayoutParams(dp(36), dp(40)))
+        }
+        card.addView(
+            controls,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.START),
+        )
+
+        showMusicMessage("再生中の曲はありません", "")
+        return card
+    }
+
+    // ---- 再生情報の取得（通知へのアクセスが許可されているとき） ----
+
+    private fun startMusic() {
+        if (!isNotificationAccessEnabled()) {
+            showMusicMessage(
+                "タップして通知へのアクセスを許可",
+                "曲名とジャケットの表示に使います",
+            )
+            return
+        }
+        try {
+            sessionManager.addOnActiveSessionsChangedListener(sessionsListener, listenerComponent, handler)
+            sessionsListenerRegistered = true
+        } catch (_: SecurityException) {
+        }
+        refreshSessions()
+    }
+
+    private fun stopMusic() {
+        if (sessionsListenerRegistered) {
+            try {
+                sessionManager.removeOnActiveSessionsChangedListener(sessionsListener)
+            } catch (_: Exception) {
+            }
+            sessionsListenerRegistered = false
+        }
+        detachController()
+    }
+
+    private fun detachController() {
+        currentController?.unregisterCallback(controllerCallback)
+        currentController = null
+    }
+
+    private fun refreshSessions() {
+        if (!isNotificationAccessEnabled()) return
+        val list = try {
+            sessionManager.getActiveSessions(listenerComponent)
+        } catch (_: SecurityException) {
+            emptyList<MediaController>()
+        }
+        pickController(list)
+    }
+
+    private fun pickController(list: List<MediaController>) {
+        val target = selectedPlayer
+        val c = if (target != null) {
+            list.firstOrNull { it.packageName == target }
+        } else {
+            list.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+                ?: list.firstOrNull { it.sessionToken == currentController?.sessionToken }
+                ?: list.firstOrNull()
+        }
+        if (c != null && c.sessionToken == currentController?.sessionToken) return
+        detachController()
+        currentController = c
+        if (c == null) {
+            val app = apps.firstOrNull { it.packageName == target }
+            if (app != null) {
+                showMusicMessage("${app.label} は再生していません", "タップで開く")
+            } else {
+                showMusicMessage("再生中の曲はありません", "")
+            }
+            return
+        }
+        c.registerCallback(controllerCallback, handler)
+        showTrack(c.metadata)
+        showPlaying(c.playbackState?.state == PlaybackState.STATE_PLAYING)
+    }
+
+    // ---- カードの表示 ----
+
+    private fun showMusicMessage(title: String, sub: String) {
+        artToken++
+        musicAlbum.visibility = View.GONE
+        musicTitle.text = title
+        musicArtist.text = sub
+        showArt(null)
+        showPlaying(false)
+    }
+
+    private fun showTrack(md: MediaMetadata?) {
+        musicTitle.text = md?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "（曲名なし）"
+        musicArtist.text = md?.getString(MediaMetadata.METADATA_KEY_ARTIST)
+            ?: md?.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST) ?: ""
+        val album = md?.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
+        musicAlbum.text = album
+        musicAlbum.visibility = if (album.isEmpty()) View.GONE else View.VISIBLE
+        loadArt(md)
+    }
+
+    private fun showPlaying(playing: Boolean) {
+        playIcon.type = if (playing) MediaIconView.PAUSE else MediaIconView.PLAY
+        playIcon.invalidate()
+    }
+
+    // ジャケット: 曲情報に画像が入っていればそれを、無ければ画像のURI（content/file）を読む
+    private fun loadArt(md: MediaMetadata?) {
+        val token = ++artToken
+        val bmp = md?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+            ?: md?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+            ?: md?.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
+        if (bmp != null) {
+            showArt(bmp)
+            return
+        }
+        val uri = (md?.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
+            ?: md?.getString(MediaMetadata.METADATA_KEY_ART_URI)
+            ?: md?.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI))?.let { Uri.parse(it) }
+        showArt(null)
+        if (uri == null || uri.scheme !in listOf("content", "file", "android.resource")) return
+        Thread {
+            val decoded = try {
+                contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+            } catch (_: Exception) {
+                null
+            }
+            handler.post { if (token == artToken && decoded != null) showArt(decoded) }
+        }.start()
+    }
+
+    private fun showArt(bmp: Bitmap?) {
+        if (bmp == null) {
+            artView.visibility = View.GONE
+            fadeView.visibility = View.GONE
+            applyCardColors(null)
+            return
+        }
+        artView.setImageBitmap(bmp)
+        artView.visibility = View.VISIBLE
+        fadeView.visibility = View.VISIBLE
+        val one = Bitmap.createScaledBitmap(bmp, 1, 1, true)
+        val avg = one.getPixel(0, 0) or 0xFF000000.toInt()
+        applyCardColors(avg)
+    }
+
+    private fun applyCardColors(bg: Int?) {
+        val light = bg != null &&
+            (0.299 * Color.red(bg) + 0.587 * Color.green(bg) + 0.114 * Color.blue(bg)) / 255.0 > 0.6
+        val fg = if (light) Color.rgb(24, 24, 24) else Color.WHITE
+        cardBg.setColor(bg ?: Color.argb(48, 255, 255, 255))
+        if (bg != null) fadeBg.colors = intArrayOf(bg, bg and 0x00FFFFFF)
+        fun withAlpha(c: Int, a: Int) = (c and 0x00FFFFFF) or (a shl 24)
+        musicTitle.setTextColor(fg)
+        musicAlbum.setTextColor(withAlpha(fg, 190))
+        musicArtist.setTextColor(withAlpha(fg, 220))
+        controlIcons.forEach { it.setIconColor(fg) }
+    }
+
+    // ---- 操作 ----
+
+    // 選んだアプリの再生を直接操作する。そのアプリが動いていないときは、アプリを開く
+    private fun mediaAction(kind: Int) {
+        val c = currentController
+        if (c != null) {
+            val t = c.transportControls
+            when (kind) {
+                MediaIconView.PREV -> t.skipToPrevious()
+                MediaIconView.NEXT -> t.skipToNext()
+                else ->
+                    if (c.playbackState?.state == PlaybackState.STATE_PLAYING) t.pause() else t.play()
+            }
+            return
+        }
+        val app = apps.firstOrNull { it.packageName == selectedPlayer }
+        if (app != null) {
+            launch(app)
+            return
+        }
+        // 通知へのアクセス未許可など: 再生中のアプリにメディアキーを送る
+        sendMediaKey(
+            when (kind) {
+                MediaIconView.PREV -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
+                MediaIconView.NEXT -> KeyEvent.KEYCODE_MEDIA_NEXT
+                else -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+            },
+        )
+    }
+
     private fun sendMediaKey(keyCode: Int) {
         val audio = getSystemService(AUDIO_SERVICE) as AudioManager
         audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
         audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
-        handler.postDelayed({ refreshMusic() }, 300)
     }
 
-    // 曲名の表示には「通知へのアクセス」の許可が必要（Androidの仕組み上、ここ経由でしか再生情報を読めない）
-    private fun isNotificationAccessEnabled(): Boolean {
-        val flat = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
-            ?: return false
-        return flat.split(":").any { ComponentName.unflattenFromString(it)?.packageName == packageName }
+    private fun adjustVolume(direction: Int) {
+        val audio = getSystemService(AUDIO_SERVICE) as AudioManager
+        audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, direction, AudioManager.FLAG_SHOW_UI)
     }
 
-    private fun refreshMusic() {
-        if (!isNotificationAccessEnabled()) {
-            currentController = null
-            musicTitle.text = "タップして通知へのアクセスを許可"
-            musicArtist.text = "曲名の表示に使います（操作ボタンは許可なしでも使えます）"
-            playButton.text = "\u25B6\uFE0E"
-            return
-        }
-        val controllers = try {
-            getSystemService(MediaSessionManager::class.java)
-                .getActiveSessions(ComponentName(this, MediaListenerService::class.java))
-        } catch (_: SecurityException) {
-            emptyList<MediaController>()
-        }
-        val c = controllers.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
-            ?: controllers.firstOrNull()
-        currentController = c
-        if (c == null) {
-            musicTitle.text = "再生中の曲はありません"
-            musicArtist.text = ""
-            playButton.text = "\u25B6\uFE0E"
-            return
-        }
-        val md = c.metadata
-        musicTitle.text = md?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "（曲名なし）"
-        musicArtist.text = md?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
-        playButton.text =
-            if (c.playbackState?.state == PlaybackState.STATE_PLAYING) "\u275A\u275A" else "\u25B6\uFE0E"
-    }
-
-    // 曲名をタップ: 許可がなければ許可画面へ、あれば再生中のアプリを開く
+    // 曲名の行をタップ: 許可がなければ許可画面へ、再生中ならそのアプリを、停止中なら選んだアプリを開く
     private fun onMusicInfoClick() {
         if (!isNotificationAccessEnabled()) {
             try {
@@ -635,10 +938,22 @@ class MainActivity : Activity() {
             }
             return
         }
-        try {
-            currentController?.sessionActivity?.send()
-        } catch (_: Exception) {
+        val c = currentController
+        if (c != null) {
+            try {
+                c.sessionActivity?.send()
+            } catch (_: Exception) {
+            }
+            return
         }
+        apps.firstOrNull { it.packageName == selectedPlayer }?.let { launch(it) }
+    }
+
+    // 曲名の表示には「通知へのアクセス」の許可が必要（Androidの仕組み上、ここ経由でしか再生情報を読めない）
+    private fun isNotificationAccessEnabled(): Boolean {
+        val flat = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+            ?: return false
+        return flat.split(":").any { ComponentName.unflattenFromString(it)?.packageName == packageName }
     }
 
     private fun appLabelOf(pkg: String): String =
@@ -698,7 +1013,7 @@ class MainActivity : Activity() {
             favContainer.addView(
                 TextView(this).apply {
                     text = "左にスワイプしてアプリ一覧を開き、アプリを長押ししてお気に入りに追加します。"
-                    setTextColor(Color.argb(180, 255, 255, 255))
+                    setTextColor(alphaOf(uiColor, 180))
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f * textScale)
                 },
             )
@@ -709,7 +1024,7 @@ class MainActivity : Activity() {
             favContainer.addView(
                 TextView(this).apply {
                     text = app.label
-                    setTextColor(Color.WHITE)
+                    setTextColor(uiColor)
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 34f * textScale)
                     setSingleLine(true)
                     ellipsize = TextUtils.TruncateAt.END
@@ -849,28 +1164,20 @@ class MainActivity : Activity() {
         ).toInt()
 
     private inner class AppAdapter : BaseAdapter() {
-        // 検索語があるときは末尾に「Webで検索」の行を足す
-        private fun hasWebRow() = query().isNotEmpty()
-
-        override fun getCount() = shown.size + if (hasWebRow()) 1 else 0
-        override fun getItem(position: Int) = shown.getOrNull(position)
+        override fun getCount() = shown.size
+        override fun getItem(position: Int) = shown[position]
         override fun getItemId(position: Int) = position.toLong()
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
             val view = (convertView as? TextView) ?: TextView(this@MainActivity).apply {
-                setTextColor(Color.WHITE)
+                setTextColor(uiColor)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 26f)
                 setSingleLine(true)
                 setPadding(0, dp(10), 0, dp(10))
             }
             view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 26f * textScale)
-            if (position < shown.size) {
-                view.text = shown[position].label
-                view.setTextColor(Color.WHITE)
-            } else {
-                view.text = "「${query()}」をWebで検索"
-                view.setTextColor(Color.rgb(255, 193, 7))
-            }
+            view.text = shown[position].label
+            view.setTextColor(uiColor)
             return view
         }
     }
@@ -900,6 +1207,15 @@ class AnalogClockView(context: Context) : View(context) {
     private val accent = Color.rgb(255, 193, 7)
     private val secondHand = paint(accent, 1.5f)
     private val hub = paint(accent, 1f, Paint.Style.FILL)
+
+    // 文字盤・目盛り・時針・分針の色（秒針と中心は強調色のまま）
+    fun setColor(color: Int) {
+        ring.color = color
+        tick.color = color
+        hourHand.color = color
+        minuteHand.color = color
+        invalidate()
+    }
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -956,5 +1272,85 @@ class AnalogClockView(context: Context) : View(context) {
         line(canvas, cx, cy, min * 6f, 0f, r * 0.75f, minuteHand)
         line(canvas, cx, cy, sec * 6f, -r * 0.15f, r * 0.85f, secondHand)
         canvas.drawCircle(cx, cy, 3f * density, hub)
+    }
+}
+
+
+// 音楽カードのボタン。画像を使わず、図形を描いて表示する。
+class MediaIconView(context: Context, var type: Int) : View(context) {
+
+    companion object {
+        const val VOL_DOWN = 0
+        const val PREV = 1
+        const val PLAY = 2
+        const val PAUSE = 3
+        const val NEXT = 4
+        const val VOL_UP = 5
+    }
+
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeWidth = 0.09f // 描画時に 0〜1 の座標系へ拡大するので、この単位で指定する
+    }
+    private val path = Path()
+    private val small = RectF(0.33f, 0.28f, 0.77f, 0.72f)
+    private val large = RectF(0.17f, 0.12f, 0.93f, 0.88f)
+
+    init {
+        setIconColor(Color.WHITE)
+    }
+
+    fun setIconColor(color: Int) {
+        fill.color = color
+        stroke.color = color
+        invalidate()
+    }
+
+    private fun triangle(x1: Float, y1: Float, x2: Float, y2: Float, x3: Float, y3: Float): Path {
+        path.reset()
+        path.moveTo(x1, y1)
+        path.lineTo(x2, y2)
+        path.lineTo(x3, y3)
+        path.close()
+        return path
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val size = minOf(width, height).toFloat()
+        val s = size * 0.46f
+        canvas.save()
+        canvas.translate((width - s) / 2f, (height - s) / 2f)
+        canvas.scale(s, s)
+        when (type) {
+            PLAY -> canvas.drawPath(triangle(0.22f, 0.08f, 0.92f, 0.5f, 0.22f, 0.92f), fill)
+            PAUSE -> {
+                canvas.drawRect(0.15f, 0.1f, 0.4f, 0.9f, fill)
+                canvas.drawRect(0.6f, 0.1f, 0.85f, 0.9f, fill)
+            }
+            NEXT -> {
+                canvas.drawPath(triangle(0.08f, 0.1f, 0.68f, 0.5f, 0.08f, 0.9f), fill)
+                canvas.drawRect(0.72f, 0.1f, 0.92f, 0.9f, fill)
+            }
+            PREV -> {
+                canvas.drawRect(0.08f, 0.1f, 0.28f, 0.9f, fill)
+                canvas.drawPath(triangle(0.92f, 0.1f, 0.32f, 0.5f, 0.92f, 0.9f), fill)
+            }
+            VOL_DOWN, VOL_UP -> {
+                path.reset()
+                path.moveTo(0.02f, 0.36f)
+                path.lineTo(0.24f, 0.36f)
+                path.lineTo(0.52f, 0.1f)
+                path.lineTo(0.52f, 0.9f)
+                path.lineTo(0.24f, 0.64f)
+                path.lineTo(0.02f, 0.64f)
+                path.close()
+                canvas.drawPath(path, fill)
+                canvas.drawArc(small, -50f, 100f, false, stroke)
+                if (type == VOL_UP) canvas.drawArc(large, -50f, 100f, false, stroke)
+            }
+        }
+        canvas.restore()
     }
 }
