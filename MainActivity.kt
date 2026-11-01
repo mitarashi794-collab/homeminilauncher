@@ -1012,9 +1012,9 @@ class MainActivity : Activity() {
         }
     }
 
-    // 並び替え用のキー。全角英数は半角に、よくある漢字語とかなはローマ字にする（表示名そのものは変えない）
+    // 並び替え用のキー。全角英数は半角に、かなはローマ字にする（表示名そのものは変えない）
     private fun romajiKey(label: String): String {
-        val t = KanjiReadings.toKana(Normalizer.normalize(label, Normalizer.Form.NFKC).trim())
+        val t = Normalizer.normalize(label, Normalizer.Form.NFKC).trim()
         return try {
             kanaToLatin?.transliterate(t) ?: t
         } catch (_: Exception) {
